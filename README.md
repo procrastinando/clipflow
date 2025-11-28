@@ -20,7 +20,8 @@ A modern, high-performance YouTube downloader and transcriber. ClipFlow allows y
 *   **Translation**: Option to translate foreign subtitles directly to English.
 *   **Modern UI**: Dark mode, glassmorphism design, and history tracking.
 *   **Live Progress**: Docker-style progress bars showing independent status for downloading, encoding, transcribing, and finalizing.
-*   **NOTE**: This will **NOT** work if your IP is backlisted by YouTube.
+
+**NOTE**: This will **NOT** work if your IP is backlisted by YouTube.
 
 ---
 
