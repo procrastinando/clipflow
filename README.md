@@ -3,9 +3,13 @@
 A modern, high-performance YouTube downloader and transcriber. ClipFlow allows you to download videos, extract audio, and generate subtitles using Groq's lightning-fast Whisper API, all wrapped in a beautiful, responsive web interface.
 
 <img width="675" height="1032" alt="clipflow1" src="https://github.com/user-attachments/assets/9aaef8ba-1f04-473c-aca4-313f17a8c652" />
+
 ---
+
 <img width="675" height="1032" alt="clipflow2" src="https://github.com/user-attachments/assets/73b6eef3-eab7-4abf-95c5-2ffc912715e6" />
+
 ---
+
 <img width="675" height="1032" alt="clipflow3" src="https://github.com/user-attachments/assets/dc9ce5e3-30d7-4105-8e99-e31a475e0d82" />
 
 ## ✨ Features
