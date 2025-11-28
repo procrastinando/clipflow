@@ -29,7 +29,7 @@ A modern, high-performance YouTube downloader and transcriber. ClipFlow allows y
 
 **No Python or FFmpeg installation required.**
 
-1.  Go to the **[Releases]([../../releases](https://github.com/procrastinando/clipflow/releases)** page of this repository.
+1.  Go to the **[Releases](https://github.com/procrastinando/clipflow/releases)** page of this repository.
 2.  Download the latest `ClipFlow.exe`.
 3.  Double-click the executable.
 4.  The application will start, and your default browser will open automatically to `http://127.0.0.1:5000`.
