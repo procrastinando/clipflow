@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ClipFlow</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body>
+
+<div class="app-container">
+    <header>
+        <h1><i class="ph ph-video"></i> ClipFlow</h1>
+        <p>Download, Transcribe, Remux</p>
+    </header>
+
+    <!-- STEP 1: INPUT -->
+    <div id="step-1" class="slide active">
+        <div class="input-group">
+            <input type="text" id="youtube-url" placeholder="Paste YouTube Link here...">
+            <button id="btn-next" onclick="fetchInfo()">Next <i class="ph ph-arrow-right"></i></button>
+        </div>
+    </div>
+
+    <!-- STEP 2: OPTIONS -->
+    <div id="step-2" class="slide">
+        <div class="media-info">
+            <img id="thumb-preview" src="" alt="Thumbnail">
+            <div class="meta">
+                <h3 id="video-title">Video Title</h3>
+                <span id="video-duration" class="badge">00:00</span>
+            </div>
+        </div>
+
+        <div class="options-grid">
+            <div class="field">
+                <label>Video Quality</label>
+                <select id="video-quality">
+                    <option value="none">No Video (Audio Only)</option>
+                </select>
+            </div>
+            
+            <div class="field">
+                <label>Audio Quality</label>
+                <select id="audio-quality">
+                </select>
+            </div>
+
+            <div class="field full-width checkbox-field">
+                <input type="checkbox" id="gen-subs" onchange="toggleApiKey()">
+                <label for="gen-subs">Generate Subtitles (Whisper Large V3)</label>
+                <span class="warning-text" id="duration-warning" style="display:none;">(Video > 2h - Unavailable)</span>
+            </div>
+
+            <div class="field full-width" id="api-input-container" style="display: none;">
+                <label>Groq API Key 
+                    <a href="https://console.groq.com/keys" target="_blank" class="api-link">Get Key <i class="ph ph-arrow-square-out"></i></a>
+                </label>
+                <input type="password" id="groq-key" placeholder="gsk_...">
+            </div>
+
+            <div class="field full-width">
+                <details class="advanced-settings">
+                    <summary><i class="ph ph-gear"></i> Advanced settings</summary>
+                    <div class="advanced-content">
+                        <div class="checkbox-field no-bg">
+                            <input type="checkbox" id="translate-subs">
+                            <label for="translate-subs">Translate subtitles to English</label>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+
+        <div class="actions horizontal">
+            <button class="btn-secondary" onclick="changeSlide(1)">Back</button>
+            <button class="btn-primary" onclick="startConversion()">Convert <i class="ph ph-magic-wand"></i></button>
+        </div>
+    </div>
+
+    <!-- STEP 3: DYNAMIC TASK LIST (Docker Style) -->
+    <div id="step-3" class="slide">
+        <h3 style="text-align:center; margin-bottom: 20px;">Processing...</h3>
+        
+        <div class="task-list">
+            <!-- Audio DL -->
+            <div class="task-item" id="task-audio_dl">
+                <div class="task-icon"><i class="ph ph-circle"></i></div>
+                <div class="task-info">
+                    <div class="task-header">
+                        <span>Downloading Audio</span>
+                        <span class="task-detail">Waiting...</span>
+                    </div>
+                    <div class="progress-track"><div class="progress-fill"></div></div>
+                </div>
+            </div>
+
+            <!-- Video DL -->
+            <div class="task-item" id="task-video_dl">
+                <div class="task-icon"><i class="ph ph-circle"></i></div>
+                <div class="task-info">
+                    <div class="task-header">
+                        <span>Downloading Video</span>
+                        <span class="task-detail">Waiting...</span>
+                    </div>
+                    <div class="progress-track"><div class="progress-fill"></div></div>
+                </div>
+            </div>
+
+            <!-- Conversion -->
+            <div class="task-item" id="task-conversion">
+                <div class="task-icon"><i class="ph ph-circle"></i></div>
+                <div class="task-info">
+                    <div class="task-header">
+                        <span>Audio Conversion</span>
+                        <span class="task-detail">Waiting...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Transcription -->
+            <div class="task-item" id="task-transcription">
+                <div class="task-icon"><i class="ph ph-circle"></i></div>
+                <div class="task-info">
+                    <div class="task-header">
+                        <span>Transcription</span>
+                        <span class="task-detail">Waiting...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Finalization -->
+            <div class="task-item" id="task-finalization">
+                <div class="task-icon"><i class="ph ph-circle"></i></div>
+                <div class="task-info">
+                    <div class="task-header">
+                        <span>Finalizing</span>
+                        <span class="task-detail">Waiting...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 4: RESULT -->
+    <div id="step-4" class="slide">
+        <div class="success-icon"><i class="ph ph-check-circle"></i></div>
+        <h2>Conversion Complete!</h2>
+        
+        <div class="result-card">
+            <img id="res-thumb" src="">
+            <div class="res-details">
+                <h4 id="res-title">Title</h4>
+                <p id="res-size">0 MB</p>
+                <p id="res-duration">00:00</p>
+            </div>
+        </div>
+
+        <div class="actions vertical">
+            <a id="btn-dl-media" href="#" class="btn-primary full-btn" download><i class="ph ph-download-simple"></i> Download Media</a>
+            <a id="btn-dl-sub" href="#" class="btn-secondary full-btn" style="display:none;" download><i class="ph ph-file-text"></i> Download Subtitles (.srt)</a>
+            <button class="btn-text" onclick="resetApp()">Convert Another</button>
+        </div>
+    </div>
+
+    <div class="history-panel">
+        <h3>History</h3>
+        <ul id="history-list"></ul>
+    </div>
+</div>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
