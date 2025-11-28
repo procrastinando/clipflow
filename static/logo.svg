@@ -1,0 +1,9 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <!-- Dark Background for contrast in Windows Explorer (Optional, usually icons are transparent) -->
+    <!-- Monitor Outline -->
+    <rect x="32" y="48" width="192" height="144" rx="16" stroke="#8b5cf6" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Stand -->
+    <line x1="80" y1="224" x2="176" y2="224" stroke="#8b5cf6" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Play Button Triangle (Filled) -->
+    <path d="M112 152V88L160 120L112 152Z" fill="#8b5cf6" stroke="#8b5cf6" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
