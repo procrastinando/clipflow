@@ -308,4 +308,5 @@ def download_file(filename):
     return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    debug_mode = not getattr(sys, 'frozen', False)
+    app.run(host='0.0.0.0', debug=debug_mode, port=5000)
