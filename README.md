@@ -53,10 +53,12 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - downloads:/app/downloads
+      - app:/app
+      - youtube:/youtube
     restart: unless-stopped
 volumes:
-  downloads:
+  app:
+  youtube:
 ```
 
 3.  Run the container:
