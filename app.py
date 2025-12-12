@@ -3,9 +3,11 @@ import sys
 import json
 import uuid
 import time
+import re
 import threading
 import subprocess
 import concurrent.futures
+import shutil
 from flask import Flask, render_template, request, jsonify, send_from_directory, Response
 from yt_dlp import YoutubeDL
 from groq import Groq
@@ -28,14 +30,30 @@ app = Flask(__name__, template_folder=TEMPLATE_DIR, static_folder=STATIC_DIR)
 # --- CONFIG ---
 MAX_CPU = 4
 GROQ_BITRATE = '27k'
-DOWNLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'downloads')
+DOWNLOAD_FOLDER = os.path.abspath('/youtube') 
 TEMP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'temp')
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+# Ensure directories exist
+try:
+    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+except PermissionError:
+    print(f"ERROR: Permission denied creating {DOWNLOAD_FOLDER}. Please run as Administrator/Root or change permissions.")
+    
 os.makedirs(TEMP_FOLDER, exist_ok=True)
 
 jobs = {}
 
-# ... (Keep format_timestamp and generate_srt functions as they were) ...
+# --- UTILS ---
+def sanitize_filename(name):
+    """
+    Sanitizes a string to be safe for filenames/directories.
+    Removes characters like / \ : * ? " < > |
+    """
+    if not name: return "untitled"
+    s = re.sub(r'[\\/*?:"<>|]', '', name)
+    s = s.strip()
+    return s if s else "untitled"
+
 def format_timestamp(seconds):
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -76,40 +94,54 @@ def process_conversion(job_id, data):
     
     url = data['url']
     video_quality = data['video_quality']
-    audio_quality = data['audio_quality']
+    # If the user selected a specific language track, audio_quality contains that specific format ID
+    audio_quality = data['audio_quality'] 
     groq_api_key = data['groq_api_key']
     gen_subtitles = data['gen_subtitles']
     translate_subs = data.get('translate_subs', False)
     
     temp_id = str(uuid.uuid4())
-    # We will determine extensions dynamically during download
     audio_base = os.path.join(TEMP_FOLDER, f"{temp_id}_audio")
     video_base = os.path.join(TEMP_FOLDER, f"{temp_id}_video")
     opus_path = os.path.join(TEMP_FOLDER, f"{temp_id}_groq.opus")
     
-    # Shared dictionary to store results from threads
+    meta_info = {'channel': 'Unknown', 'title': 'Video', 'height': None, 'abr': None}
     thread_results = {'audio_path': None, 'audio_ext': None, 'video_path': None}
 
     try:
         ffmpeg_loc = os.path.dirname(FFMPEG_BIN) if os.path.isabs(FFMPEG_BIN) else None
-        ydl_common_opts = {'quiet': True, 'ffmpeg_location': ffmpeg_loc}
+        ydl_common_opts = {
+            'quiet': True, 
+            'ffmpeg_location': ffmpeg_loc,
+            'noplaylist': True,
+            'no_warnings': True
+        }
 
         # --- TASK 1: DOWNLOAD AUDIO ---
         jobs[job_id]['tasks']['audio_dl']['status'] = 'running'
         
         ydl_opts_audio = {
             **ydl_common_opts,
-            'format': audio_quality,
+            'format': audio_quality, # This ID ensures the correct language track is downloaded
             'outtmpl': audio_base + '.%(ext)s',
             'progress_hooks': [make_progress_hook(job_id, 'audio_dl')]
         }
         
         with YoutubeDL(ydl_opts_audio) as ydl:
-            info = ydl.extract_info(url, download=True)
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as dl_err:
+                raise Exception(f"Download failed. Please update yt-dlp. Error: {str(dl_err)}")
+
+            if 'entries' in info: info = info['entries'][0]
+
             thread_results['audio_ext'] = info['ext']
             thread_results['audio_path'] = f"{audio_base}.{info['ext']}"
-            final_title = info.get('title', 'video')
-        
+            
+            meta_info['title'] = info.get('title', 'video')
+            meta_info['channel'] = info.get('uploader', 'Unknown_Channel')
+            meta_info['abr'] = int(info.get('abr', 0)) if info.get('abr') else 0
+
         jobs[job_id]['tasks']['audio_dl']['status'] = 'done'
         jobs[job_id]['tasks']['audio_dl']['progress'] = '100'
 
@@ -125,6 +157,9 @@ def process_conversion(job_id, data):
                 }
                 with YoutubeDL(ydl_opts_video) as ydl:
                     v_info = ydl.extract_info(url, download=True)
+                    if 'entries' in v_info: v_info = v_info['entries'][0]
+                    
+                    meta_info['height'] = v_info.get('height')
                     jobs[job_id]['tasks']['video_dl']['status'] = 'done'
                     return f"{video_base}.{v_info['ext']}"
             else:
@@ -134,12 +169,21 @@ def process_conversion(job_id, data):
         def task_prepare_groq_audio():
             if gen_subtitles and groq_api_key:
                 jobs[job_id]['tasks']['conversion']['status'] = 'running'
-                jobs[job_id]['tasks']['conversion']['detail'] = f'Encoding to Opus {GROQ_BITRATE}'
-                # This conversion MUST happen for Groq API (needs 16k mono), but it is temporary
-                cmd = f'"{FFMPEG_BIN}" -y -i "{thread_results["audio_path"]}" -map 0:a:0 -b:a {GROQ_BITRATE} -ac 1 -ar 16000 "{opus_path}" -v quiet'
-                run_ffmpeg(cmd)
-                jobs[job_id]['tasks']['conversion']['status'] = 'done'
-                return opus_path
+                raw_audio_path = thread_results["audio_path"]
+                # 25 MB Limit Check
+                file_size_bytes = os.path.getsize(raw_audio_path)
+                limit_bytes = 25 * 1024 * 1024 
+
+                if file_size_bytes > limit_bytes:
+                    jobs[job_id]['tasks']['conversion']['detail'] = f'Compressing (>25MB) to Opus...'
+                    cmd = f'"{FFMPEG_BIN}" -y -i "{raw_audio_path}" -map 0:a:0 -b:a {GROQ_BITRATE} -ac 1 -ar 16000 "{opus_path}" -v quiet'
+                    run_ffmpeg(cmd)
+                    jobs[job_id]['tasks']['conversion']['status'] = 'done'
+                    return opus_path
+                else:
+                    jobs[job_id]['tasks']['conversion']['detail'] = 'Using original audio (<25MB)'
+                    jobs[job_id]['tasks']['conversion']['status'] = 'done'
+                    return raw_audio_path
             else:
                 jobs[job_id]['tasks']['conversion']['status'] = 'skipped'
                 jobs[job_id]['tasks']['transcription']['status'] = 'skipped'
@@ -147,84 +191,103 @@ def process_conversion(job_id, data):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CPU) as executor:
             future_video = executor.submit(task_download_video)
-            future_audio_conv = executor.submit(task_prepare_groq_audio)
+            future_audio_groq = executor.submit(task_prepare_groq_audio)
             
             thread_results['video_path'] = future_video.result()
-            _ = future_audio_conv.result()
+            audio_for_transcription = future_audio_groq.result()
 
         # --- TRANSCRIPTION ---
-        srt_path = None
-        if gen_subtitles and os.path.exists(opus_path):
+        srt_path_temp = None
+        if gen_subtitles and audio_for_transcription and os.path.exists(audio_for_transcription):
             jobs[job_id]['tasks']['transcription']['status'] = 'running'
             client = Groq(api_key=groq_api_key)
-            with open(opus_path, "rb") as file:
+            
+            with open(audio_for_transcription, "rb") as file:
+                filename_for_api = os.path.basename(audio_for_transcription)
                 if translate_subs:
                     jobs[job_id]['tasks']['transcription']['detail'] = 'Translating...'
                     resp = client.audio.translations.create(
-                        file=(opus_path, file.read()), model="whisper-large-v3", response_format="verbose_json", temperature=0.0
+                        file=(filename_for_api, file.read()), 
+                        model="whisper-large-v3", 
+                        response_format="verbose_json", 
+                        temperature=0.0
                     )
                 else:
                     jobs[job_id]['tasks']['transcription']['detail'] = 'Transcribing...'
                     resp = client.audio.transcriptions.create(
-                        file=(opus_path, file.read()), model="whisper-large-v3", response_format="verbose_json", temperature=0.0
+                        file=(filename_for_api, file.read()), 
+                        model="whisper-large-v3", 
+                        response_format="verbose_json", 
+                        temperature=0.0
                     )
             
             srt_content = generate_srt(resp.segments)
-            srt_path = os.path.join(DOWNLOAD_FOLDER, f"{temp_id}.srt")
-            with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
-            os.remove(opus_path)
+            srt_path_temp = os.path.join(TEMP_FOLDER, f"{temp_id}.srt")
+            with open(srt_path_temp, "w", encoding="utf-8") as f: f.write(srt_content)
+            
+            if audio_for_transcription == opus_path and os.path.exists(opus_path):
+                os.remove(opus_path)
+                
             jobs[job_id]['tasks']['transcription']['status'] = 'done'
 
-        # --- FINALIZATION (SMART COPY) ---
+        # --- FINALIZATION ---
         jobs[job_id]['tasks']['finalization']['status'] = 'running'
-        jobs[job_id]['tasks']['finalization']['detail'] = 'Remuxing (Direct Stream Copy)...'
+        jobs[job_id]['tasks']['finalization']['detail'] = 'Saving to /youtube...'
+
+        safe_channel = sanitize_filename(meta_info['channel'])
+        safe_title = sanitize_filename(meta_info['title'])
+        channel_dir = os.path.join(DOWNLOAD_FOLDER, safe_channel)
+        os.makedirs(channel_dir, exist_ok=True)
 
         maps = []
         cmd_build = f'"{FFMPEG_BIN}" -y '
         
-        # Scenario 1: Video + Audio
         if thread_results['video_path']:
-            final_ext = "mkv" # MKV is safest for direct stream copy of any codec mix
-            final_path = os.path.join(DOWNLOAD_FOLDER, f"{temp_id}.{final_ext}")
+            final_ext = "mkv"
+            quality_suffix = f"_{meta_info['height']}" if meta_info['height'] else "_video"
+            final_filename = f"{safe_title}{quality_suffix}.{final_ext}"
+            final_path = os.path.join(channel_dir, final_filename)
             
             cmd_build += f'-i "{thread_results["video_path"]}" -i "{thread_results["audio_path"]}" '
-            maps.append('-map 0:v:0 -map 1:a:0') # Map Video and Audio
+            maps.append('-map 0:v:0 -map 1:a:0')
             
-            # Embed subtitles in video container
-            if srt_path:
-                cmd_build += f'-i "{srt_path}" '
+            if srt_path_temp:
+                cmd_build += f'-i "{srt_path_temp}" '
                 maps.append('-map 2:s:0')
-                cmd_build += '-c:s srt ' # SRT is native to MKV
-
-            # Copy codecs (0% CPU, 1:1 Quality/Size)
+                cmd_build += '-c:s srt '
+            
             cmd_build += f'-c:v copy -c:a copy '
-        
-        # Scenario 2: Audio Only
         else:
-            final_ext = thread_results['audio_ext'] # Keep original extension (m4a, webm, etc)
-            final_path = os.path.join(DOWNLOAD_FOLDER, f"{temp_id}.{final_ext}")
+            final_ext = thread_results['audio_ext']
+            quality_suffix = f"_{meta_info['abr']}" if meta_info['abr'] else "_audio"
+            final_filename = f"{safe_title}{quality_suffix}.{final_ext}"
+            final_path = os.path.join(channel_dir, final_filename)
             
             cmd_build += f'-i "{thread_results["audio_path"]}" '
             maps.append('-map 0:a:0')
-            
-            # -vn removes any potential video streams (thumbnails) that confused players
-            # -c:a copy preserves exact original data
             cmd_build += '-vn -c:a copy '
 
-        # Execute
         cmd_build += " ".join(maps) + f' "{final_path}" -v quiet'
         run_ffmpeg(cmd_build)
 
-        # Cleanup
+        final_srt_name = None
+        if srt_path_temp:
+            srt_filename = f"{safe_title}.srt"
+            final_srt_path = os.path.join(channel_dir, srt_filename)
+            shutil.move(srt_path_temp, final_srt_path)
+            final_srt_name = os.path.join(safe_channel, srt_filename).replace("\\", "/")
+
         if thread_results['video_path'] and os.path.exists(thread_results['video_path']): os.remove(thread_results['video_path'])
         if os.path.exists(thread_results['audio_path']): os.remove(thread_results['audio_path'])
 
+        relative_filename = os.path.join(safe_channel, final_filename).replace("\\", "/")
+        
         jobs[job_id]['tasks']['finalization']['status'] = 'done'
         jobs[job_id]['status'] = 'completed'
         jobs[job_id]['result'] = {
-            'filename': f"{temp_id}.{final_ext}",
-            'srt_filename': f"{temp_id}.srt" if srt_path else None,
-            'title': final_title,
+            'filename': relative_filename,
+            'srt_filename': final_srt_name,
+            'title': meta_info['title'],
             'size': f"{os.path.getsize(final_path) / (1024*1024):.2f} MB"
         }
 
@@ -233,34 +296,47 @@ def process_conversion(job_id, data):
         jobs[job_id]['status'] = 'error'
         jobs[job_id]['error'] = str(e)
 
-# ... (Routes remain the same) ...
+# --- ROUTES ---
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/info', methods=['POST'])
 def get_info():
-    # ... (Same as previous provided code) ...
-    # Ensure you use the get_info from the previous full file I sent, 
-    # ensuring it has the ffmpeg_location fix.
     url = request.json.get('url')
     try:
         ffmpeg_loc = os.path.dirname(FFMPEG_BIN) if os.path.isabs(FFMPEG_BIN) else None
-        ydl_opts = {'quiet': True, 'ffmpeg_location': ffmpeg_loc}
+        ydl_opts = {'quiet': True, 'ffmpeg_location': ffmpeg_loc, 'noplaylist': True}
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         
+        if 'entries' in info: info = info['entries'][0]
+
         formats = info.get('formats', [])
         video_formats = []
         audio_formats = []
         for f in formats:
+            # Video only
             if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
                 size_mb = f.get('filesize', 0) / (1024 * 1024) if f.get('filesize') else 0
                 label = f"{f.get('resolution', 'N/A')} ({f.get('ext')})"
                 if size_mb > 0: label += f" - ~{size_mb:.1f}MB"
                 video_formats.append({'id': f['format_id'], 'label': label, 'height': f.get('height', 0)})
+            
+            # Audio only
             if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                 audio_formats.append({'id': f['format_id'], 'label': f"{f.get('abr', 'N/A')}kbps ({f.get('ext')})"})
+                 # NEW: Parse Language and Channels
+                 lang = f.get('language', 'default')
+                 if not lang: lang = 'default'
+                 
+                 channels = f.get('audio_channels')
+                 ch_label = "5.1" if channels and channels > 2 else "Stereo"
+                 
+                 # New Label format: "[en] Stereo - 128kbps (webm)"
+                 label = f"[{lang}] {ch_label} - {f.get('abr', 'N/A')}kbps ({f.get('ext')})"
+                 
+                 audio_formats.append({'id': f['format_id'], 'label': label})
+                 
         video_formats.sort(key=lambda x: x['height'], reverse=True)
         return jsonify({
             'title': info.get('title'),
