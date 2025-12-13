@@ -94,7 +94,6 @@ def process_conversion(job_id, data):
     
     url = data['url']
     video_quality = data['video_quality']
-    # If the user selected a specific language track, audio_quality contains that specific format ID
     audio_quality = data['audio_quality'] 
     groq_api_key = data['groq_api_key']
     gen_subtitles = data['gen_subtitles']
@@ -122,7 +121,7 @@ def process_conversion(job_id, data):
         
         ydl_opts_audio = {
             **ydl_common_opts,
-            'format': audio_quality, # This ID ensures the correct language track is downloaded
+            'format': audio_quality, 
             'outtmpl': audio_base + '.%(ext)s',
             'progress_hooks': [make_progress_hook(job_id, 'audio_dl')]
         }
@@ -145,7 +144,7 @@ def process_conversion(job_id, data):
         jobs[job_id]['tasks']['audio_dl']['status'] = 'done'
         jobs[job_id]['tasks']['audio_dl']['progress'] = '100'
 
-        # --- PARALLEL TASKS ---
+        # --- PARALLEL EXECUTION BLOCK ---
         def task_download_video():
             if video_quality != 'none':
                 jobs[job_id]['tasks']['video_dl']['status'] = 'running'
@@ -166,83 +165,103 @@ def process_conversion(job_id, data):
                 jobs[job_id]['tasks']['video_dl']['status'] = 'skipped'
                 return None
 
-        def task_prepare_groq_audio():
+        def task_audio_pipeline():
+            audio_for_transcription = None
+            
+            # Sub-Task A: Convert/Prepare Audio
             if gen_subtitles and groq_api_key:
                 jobs[job_id]['tasks']['conversion']['status'] = 'running'
                 raw_audio_path = thread_results["audio_path"]
-                # 25 MB Limit Check
-                file_size_bytes = os.path.getsize(raw_audio_path)
-                limit_bytes = 25 * 1024 * 1024 
+                
+                try:
+                    file_size_bytes = os.path.getsize(raw_audio_path)
+                    limit_bytes = 25 * 1024 * 1024 
 
-                if file_size_bytes > limit_bytes:
-                    jobs[job_id]['tasks']['conversion']['detail'] = f'Compressing (>25MB) to Opus...'
-                    cmd = f'"{FFMPEG_BIN}" -y -i "{raw_audio_path}" -map 0:a:0 -b:a {GROQ_BITRATE} -ac 1 -ar 16000 "{opus_path}" -v quiet'
-                    run_ffmpeg(cmd)
+                    if file_size_bytes > limit_bytes:
+                        jobs[job_id]['tasks']['conversion']['detail'] = f'Compressing (>25MB) to Opus...'
+                        cmd = f'"{FFMPEG_BIN}" -y -i "{raw_audio_path}" -map 0:a:0 -b:a {GROQ_BITRATE} -ac 1 -ar 16000 "{opus_path}" -v quiet'
+                        run_ffmpeg(cmd)
+                        audio_for_transcription = opus_path
+                    else:
+                        jobs[job_id]['tasks']['conversion']['detail'] = 'Using original audio (<25MB)'
+                        audio_for_transcription = raw_audio_path
+                    
                     jobs[job_id]['tasks']['conversion']['status'] = 'done'
-                    return opus_path
-                else:
-                    jobs[job_id]['tasks']['conversion']['detail'] = 'Using original audio (<25MB)'
-                    jobs[job_id]['tasks']['conversion']['status'] = 'done'
-                    return raw_audio_path
+                except Exception as e:
+                    jobs[job_id]['tasks']['conversion']['status'] = 'error'
+                    raise e
             else:
                 jobs[job_id]['tasks']['conversion']['status'] = 'skipped'
                 jobs[job_id]['tasks']['transcription']['status'] = 'skipped'
                 return None
 
+            # Sub-Task B: Transcribe
+            srt_generated_path = None
+            if audio_for_transcription and os.path.exists(audio_for_transcription):
+                jobs[job_id]['tasks']['transcription']['status'] = 'running'
+                try:
+                    client = Groq(api_key=groq_api_key)
+                    
+                    with open(audio_for_transcription, "rb") as file:
+                        filename_for_api = os.path.basename(audio_for_transcription)
+                        if translate_subs:
+                            jobs[job_id]['tasks']['transcription']['detail'] = 'Translating...'
+                            resp = client.audio.translations.create(
+                                file=(filename_for_api, file.read()), 
+                                model="whisper-large-v3", 
+                                response_format="verbose_json", 
+                                temperature=0.0
+                            )
+                        else:
+                            jobs[job_id]['tasks']['transcription']['detail'] = 'Transcribing...'
+                            resp = client.audio.transcriptions.create(
+                                file=(filename_for_api, file.read()), 
+                                model="whisper-large-v3", 
+                                response_format="verbose_json", 
+                                temperature=0.0
+                            )
+                    
+                    srt_content = generate_srt(resp.segments)
+                    srt_generated_path = os.path.join(TEMP_FOLDER, f"{temp_id}.srt")
+                    with open(srt_generated_path, "w", encoding="utf-8") as f: f.write(srt_content)
+                    
+                    jobs[job_id]['tasks']['transcription']['status'] = 'done'
+
+                except Exception as e:
+                    jobs[job_id]['tasks']['transcription']['status'] = 'error'
+                    print(f"Transcription Error: {e}")
+                
+                if audio_for_transcription == opus_path and os.path.exists(opus_path):
+                    os.remove(opus_path)
+            
+            return srt_generated_path
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CPU) as executor:
             future_video = executor.submit(task_download_video)
-            future_audio_groq = executor.submit(task_prepare_groq_audio)
+            future_subs = executor.submit(task_audio_pipeline)
             
             thread_results['video_path'] = future_video.result()
-            audio_for_transcription = future_audio_groq.result()
-
-        # --- TRANSCRIPTION ---
-        srt_path_temp = None
-        if gen_subtitles and audio_for_transcription and os.path.exists(audio_for_transcription):
-            jobs[job_id]['tasks']['transcription']['status'] = 'running'
-            client = Groq(api_key=groq_api_key)
-            
-            with open(audio_for_transcription, "rb") as file:
-                filename_for_api = os.path.basename(audio_for_transcription)
-                if translate_subs:
-                    jobs[job_id]['tasks']['transcription']['detail'] = 'Translating...'
-                    resp = client.audio.translations.create(
-                        file=(filename_for_api, file.read()), 
-                        model="whisper-large-v3", 
-                        response_format="verbose_json", 
-                        temperature=0.0
-                    )
-                else:
-                    jobs[job_id]['tasks']['transcription']['detail'] = 'Transcribing...'
-                    resp = client.audio.transcriptions.create(
-                        file=(filename_for_api, file.read()), 
-                        model="whisper-large-v3", 
-                        response_format="verbose_json", 
-                        temperature=0.0
-                    )
-            
-            srt_content = generate_srt(resp.segments)
-            srt_path_temp = os.path.join(TEMP_FOLDER, f"{temp_id}.srt")
-            with open(srt_path_temp, "w", encoding="utf-8") as f: f.write(srt_content)
-            
-            if audio_for_transcription == opus_path and os.path.exists(opus_path):
-                os.remove(opus_path)
-                
-            jobs[job_id]['tasks']['transcription']['status'] = 'done'
+            srt_path_temp = future_subs.result()
 
         # --- FINALIZATION ---
         jobs[job_id]['tasks']['finalization']['status'] = 'running'
-        jobs[job_id]['tasks']['finalization']['detail'] = 'Saving to /youtube...'
+        jobs[job_id]['tasks']['finalization']['detail'] = 'Saving to disk...'
 
         safe_channel = sanitize_filename(meta_info['channel'])
         safe_title = sanitize_filename(meta_info['title'])
-        channel_dir = os.path.join(DOWNLOAD_FOLDER, safe_channel)
+        
+        # DETERMINE FOLDER TYPE: 'video' or 'audio'
+        folder_type = 'video' if thread_results['video_path'] else 'audio'
+        
+        # Path: /youtube/{type}/{channel}
+        channel_dir = os.path.join(DOWNLOAD_FOLDER, folder_type, safe_channel)
         os.makedirs(channel_dir, exist_ok=True)
 
         maps = []
         cmd_build = f'"{FFMPEG_BIN}" -y '
         
         if thread_results['video_path']:
+            # VIDEO MODE
             final_ext = "mkv"
             quality_suffix = f"_{meta_info['height']}" if meta_info['height'] else "_video"
             final_filename = f"{safe_title}{quality_suffix}.{final_ext}"
@@ -251,13 +270,14 @@ def process_conversion(job_id, data):
             cmd_build += f'-i "{thread_results["video_path"]}" -i "{thread_results["audio_path"]}" '
             maps.append('-map 0:v:0 -map 1:a:0')
             
-            if srt_path_temp:
+            if srt_path_temp and os.path.exists(srt_path_temp):
                 cmd_build += f'-i "{srt_path_temp}" '
                 maps.append('-map 2:s:0')
                 cmd_build += '-c:s srt '
             
             cmd_build += f'-c:v copy -c:a copy '
         else:
+            # AUDIO MODE
             final_ext = thread_results['audio_ext']
             quality_suffix = f"_{meta_info['abr']}" if meta_info['abr'] else "_audio"
             final_filename = f"{safe_title}{quality_suffix}.{final_ext}"
@@ -270,23 +290,27 @@ def process_conversion(job_id, data):
         cmd_build += " ".join(maps) + f' "{final_path}" -v quiet'
         run_ffmpeg(cmd_build)
 
-        final_srt_name = None
-        if srt_path_temp:
+        # Handle standalone SRT file move
+        final_srt_relative = None
+        if srt_path_temp and os.path.exists(srt_path_temp):
             srt_filename = f"{safe_title}.srt"
             final_srt_path = os.path.join(channel_dir, srt_filename)
             shutil.move(srt_path_temp, final_srt_path)
-            final_srt_name = os.path.join(safe_channel, srt_filename).replace("\\", "/")
+            # Create relative path: type/channel/file.srt
+            final_srt_relative = os.path.join(folder_type, safe_channel, srt_filename).replace("\\", "/")
 
+        # Cleanup temp files
         if thread_results['video_path'] and os.path.exists(thread_results['video_path']): os.remove(thread_results['video_path'])
         if os.path.exists(thread_results['audio_path']): os.remove(thread_results['audio_path'])
 
-        relative_filename = os.path.join(safe_channel, final_filename).replace("\\", "/")
+        # Create relative path: type/channel/file.ext
+        relative_filename = os.path.join(folder_type, safe_channel, final_filename).replace("\\", "/")
         
         jobs[job_id]['tasks']['finalization']['status'] = 'done'
         jobs[job_id]['status'] = 'completed'
         jobs[job_id]['result'] = {
             'filename': relative_filename,
-            'srt_filename': final_srt_name,
+            'srt_filename': final_srt_relative,
             'title': meta_info['title'],
             'size': f"{os.path.getsize(final_path) / (1024*1024):.2f} MB"
         }
@@ -325,14 +349,12 @@ def get_info():
             
             # Audio only
             if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                 # NEW: Parse Language and Channels
                  lang = f.get('language', 'default')
                  if not lang: lang = 'default'
                  
                  channels = f.get('audio_channels')
                  ch_label = "5.1" if channels and channels > 2 else "Stereo"
                  
-                 # New Label format: "[en] Stereo - 128kbps (webm)"
                  label = f"[{lang}] {ch_label} - {f.get('abr', 'N/A')}kbps ({f.get('ext')})"
                  
                  audio_formats.append({'id': f['format_id'], 'label': label})

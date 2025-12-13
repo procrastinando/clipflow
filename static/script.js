@@ -9,8 +9,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function toggleApiKey() {
     const isChecked = document.getElementById('gen-subs').checked;
+
     const apiContainer = document.getElementById('api-input-container');
     apiContainer.style.display = isChecked ? 'block' : 'none';
+
+    const translateBtn = document.getElementById('translate-subs');
+    translateBtn.disabled = !isChecked;
+    if (!isChecked) {
+        translateBtn.checked = false;
+    }
 }
 
 function changeSlide(stepIndex) {
